@@ -52,16 +52,17 @@ jobs:
         run: |
           cd
           curl -sL https://raw.githubusercontent.com/stupidloud/nanopi-openwrt/zstd-bin/zstd | sudo tee /usr/bin/zstd > /dev/null
+          sudo chown $USER:$(id -gn) /mnt
           for i in {1..20}
           do
             curl -sL --fail https://github.com/stupidloud/sshactions/releases/download/cache/lede.$DEVICE.img.zst.0$i || break
-          done | zstdmt -d -o lede.img || (truncate -s 30g lede.img && mkfs.btrfs -M lede.img)
+          done | zstdmt -d -o /mnt/lede.img || (truncate -s 30g /mnt/lede.img && mkfs.btrfs -M /mnt/lede.img)
           LOOP_DEVICE=$(losetup -f) && echo "LOOP_DEVICE=$LOOP_DEVICE" >> $GITHUB_ENV
-          sudo losetup -P --direct-io $LOOP_DEVICE lede.img
+          sudo losetup -P --direct-io $LOOP_DEVICE /mnt/lede.img
           mkdir lede && sudo mount -o nossd,compress=zstd $LOOP_DEVICE lede
           if [ -d 'lede/.git' ]; then
           cd lede && rm -f zerospace && git config --local user.email "action@github.com" && git config --local user.name "GitHub Action"
-          git fetch && git reset --hard origin/$BRANCH && git clean -df
+          git fetch && git reset --hard origin/HEAD && git clean -df
           else
           sudo chown $USER:$(id -gn) lede && git clone -b $BRANCH --single-branch https://github.com/coolsnowwolf/lede lede
           fi
@@ -69,19 +70,13 @@ jobs:
       - name: Update feeds and packages
         run: |
           cd ~/lede
-          rm -rf ./tmp && rm -rf ./feeds && rm -rf ./pacakges/feeds
-          if [ -d 'feeds' ]; then
-            pushd feeds/packages; git restore .; popd
-            pushd feeds/luci; git restore .; popd
-            pushd feeds/routing; git restore .; popd
-            pushd feeds/telephony; git restore .; popd
-          fi
+          rm -rf tmp feeds pacakges/feeds
           ./scripts/feeds update -a
           ./scripts/feeds install -a
           . $GITHUB_WORKSPACE/scripts/merge_packages.sh
           . $GITHUB_WORKSPACE/scripts/patches.sh
           cd
-          svn export https://github.com/openwrt/luci/branches/master luci
+          git clone --depth=1 --single-branch https://github.com/openwrt/luci
           pushd luci
           ls -d */ | xargs -ri diff -q {} ../lede/feeds/luci/{} | grep Only | grep lede | grep -E applications\|themes | awk '{print $4}' | xargs -ri echo CONFIG_PACKAGE_{}=m > ~/lede/more_luci.txt
           popd
@@ -93,6 +88,7 @@ jobs:
           find package/ -type d -name luci-app-* | rev | cut -d'/' -f1 | rev | xargs -ri echo CONFIG_PACKAGE_{}=m >> .config
           cat $GITHUB_WORKSPACE/extra_packages.seed >> .config
           cat more_luci.txt >> .config
+          [ -f .config_fix ] && cat .config_fix >> .config
           make defconfig && sed -i -E 's/# (CONFIG_.*_COMPRESS_UPX) is not set/\1=y/' .config && make defconfig
           cat .config
 
@@ -121,10 +117,18 @@ jobs:
         run: |
           ulimit -SHn 65000
           cd ~/lede
-          while true; do make download -j && break || true; done
-          make -j$[`nproc`+1] IGNORE_ERRORS=1 tools/compile toolchain/compile buildinfo target/compile package/compile package/install target/install
-          if [ ! -e ~/lede/bin/targets/*/*/*imagebuilder*xz ]; then make IGNORE_ERRORS=1 V=sc; fi
+          rm -rf dl;while true; do make download -j && break || true; done
+          [ `nproc` -gt 8 ] && con=$[`nproc`/2+3] || con=`nproc`
+          if [ -d build_dir ]; then
+            make -j$con IGNORE_ERRORS=1 tools/compile toolchain/compile buildinfo target/compile package/compile package/install target/install
+            if [ ! -e ~/lede/bin/targets/*/*/*imagebuilder*xz ]; then
+            df -h
+            make V=sc
+            fi
           mv `ls ~/lede/bin/targets/*/*/*imagebuilder*xz` ~/ib-$DEVICE.tar.xz
+          else
+            make -j$con IGNORE_ERRORS=1 tools/compile toolchain/compile
+          fi
 
           echo "======================="
           echo "Space usage:"
@@ -139,8 +143,7 @@ jobs:
           cd
           mkdir -p ./artifact/buildinfo
           cd lede
-          cp -rf $(find ./bin/targets/ -type f -name "*.buildinfo" -o -name "*.manifest") ../artifact/buildinfo/
-          cp -rf .config ../artifact/buildinfo/
+          cp -rf .config $(find ./bin/targets/ -type f -name "*.buildinfo" -o -name "*.manifest") ../artifact/buildinfo/
           echo "strDate=$(TZ=UTC-8 date +%Y-%m-%d)" >> $GITHUB_ENV
           echo "strDevice=$(echo $DEVICE | awk '{print toupper($0)}')" >> $GITHUB_ENV
           cd ..
@@ -165,7 +168,8 @@ jobs:
         run: |
           cd
           sleep 60
-          sudo mount -o remount,compress=no,nodatacow,nodatasum lede
+          sudo umount lede
+          sudo mount -o compress=no,nodatacow,nodatasum $LOOP_DEVICE lede
           cd lede/; pv /dev/zero > zerospace || true; sync; rm -f zerospace; cd -
           sleep 60
           sudo umount lede
@@ -175,7 +179,7 @@ jobs:
           export cache_repo_id='39020554'
           #zstdmt -c --adapt --long lede.img | parallel --wc --block 1.99G --pipe \
           #'curl -s --data-binary @- -H "$AUTH" -H "Content-Type: application/octet-stream" https://uploads.$cache_path/$cache_repo_id/assets?name=lede.'$DEVICE'.img.zst.0{#} > /dev/null'
-          zstdmt -c --long lede.img | split --numeric=1 -b 2000m - lede.$DEVICE.img.zst.
+          zstdmt -c --long /mnt/lede.img | split --numeric=1 -b 2000m - lede.$DEVICE.img.zst.
           #for f in *img.zst*
           #do
           #  while true; do curl --data-binary @$f -H "$AUTH" -H 'Content-Type: application/octet-stream' "https://uploads.$cache_path/$cache_repo_id/assets?name=$f" && break || true; done
